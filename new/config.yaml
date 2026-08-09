@@ -1,0 +1,92 @@
+# SolBot v2 configuration.
+# Every tunable value in the system lives here. No constants in Python.
+
+app:
+  name: SolBot
+  timezone: America/Phoenix          # Arizona: MST year round, no daylight saving
+  log_level: INFO
+  log_file: solbot.log
+
+llm:
+  backend: ollama                    # ollama | stub   (stub = deterministic, for tests)
+  host: http://localhost:11434
+  chat_model: qwen3
+  embedding_model: qwen3-embedding
+  temperature: 0.1
+  json_temperature: 0.0              # structured-output calls must be deterministic
+  num_ctx: 16384
+  request_timeout_seconds: 300
+
+vector_store:
+  provider: chroma
+  directory: ./asu_rc
+  collection: ASU-Research-Computing
+  manifest_path: ./asu_rc/manifest.json   # page_id -> version/hash/chunk_ids
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
+ingest:
+  confluence_url: https://asurc.atlassian.net/wiki
+  space_key: RC
+  username: ${CONFLUENCE_USERNAME}   # ${VAR} is expanded from the environment
+  api_token: ${CONFLUENCE_API_TOKEN}
+  page_limit: 500
+  chunk_size: 1000
+  chunk_overlap: 200
+  headers_to_split_on:
+    - ["#", "h1"]
+    - ["##", "h2"]
+    - ["###", "h3"]
+  sync_interval_minutes: 360         # background refresh cadence
+  embed_batch_size: 32
+
+retrieval:
+  dense_k: 12                        # candidates from embedding search
+  sparse_k: 12                       # candidates from BM25 lexical search
+  final_k: 5                         # chunks handed to the worker after fusion
+  rrf_constant: 60                   # Reciprocal Rank Fusion damping constant
+  use_sparse: true
+  use_mmr: true
+  mmr_lambda: 0.6                    # 1.0 = pure relevance, 0.0 = pure diversity
+  use_llm_rerank: true               # ChunkRAG-style per-chunk relevance filter
+  llm_rerank_threshold: 0.45
+  min_evidence_score: 0.30           # below this the node is "under-evidenced"
+  min_evidence_count: 2
+
+planner:
+  max_nodes: 6
+  max_depth: 4
+  allow_replanning: true
+  max_replans: 1
+  decomposition_threshold_words: 8   # below this, skip the planner entirely
+
+worker:
+  max_react_steps: 4
+  max_parallel_nodes: 3
+  escalate_to_web_below_confidence: 0.55
+  answer_max_words: 180
+
+web:
+  enabled: true
+  provider: ddgs
+  max_results: 5
+  fetch_timeout_seconds: 20
+  max_fetch_chars: 12000
+  write_through_to_vector_store: true   # ingest useful fetched pages into Chroma
+  blocked_domains:
+    - pinterest.com
+    - quora.com
+
+memory:
+  max_turns_kept: 20
+  contextualize_window: 4            # turns fed to the query rewriter
+  summarize_after_turns: 12
+
+verification:
+  enabled: true
+  min_overall_confidence: 0.45
+  require_citation_per_claim: true
+
+escalation:
+  contact: "ASU Research Computing — rc-ops@asu.edu"
+  message: >-
+    I could not find a well-grounded answer in the Research Computing
+    documentation or on the web. Please contact the team directly.
