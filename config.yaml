@@ -1,0 +1,12 @@
+web:
+  enabled: true
+  search_provider: ddgs
+  extraction_backend: trafilatura
+  max_results: 5
+  search_timeout_seconds: 10
+  fetch_timeout_seconds: 15
+  max_fetch_chars: 12000
+  min_extracted_chars: 200
+  blocked_domains:
+    - pinterest.com
+    - quora.com
