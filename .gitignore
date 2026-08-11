@@ -1,3 +1,9 @@
+# SolBot: local vector database + freshness manifest + lock file (regenerable build artifacts)
+/asu_rc/
+
+# SolBot: memory_engine's SQLite conversation store (regenerable, holds local conversation history)
+/memory_store/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
