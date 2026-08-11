@@ -46,9 +46,17 @@ memory_engine.upsert_facts(session_id, facts, turns_covered)
 # Must be called once per extraction attempt, even with facts=[] on failure -- see
 # "Extraction ack contract" below.
 
+memory_engine.get_rolling_summary(session_id)
+# -> str | None. Whatever text was last stored via set_rolling_summary, or None if unset.
+
+memory_engine.set_rolling_summary(session_id, summary)
+# Atomically overwrites the session's rolling summary. Storage only -- this package
+# never generates or compresses the summary text itself, same boundary as everywhere
+# else; a future agent's own compression pass produces the text and calls this to store it.
+
 memory_engine.clear_session(session_id)
-# Deletes this session's messages and embeddings. Facts are NOT deleted -- they're
-# user-scoped and meant to outlive an individual session clear.
+# Deletes this session's messages, embeddings, and rolling summary. Facts are NOT
+# deleted -- they're user-scoped and meant to outlive an individual session clear.
 ```
 
 All functions accept an optional `cfg` override; otherwise they use `memory_engine.read_config()` (backed by `config.yaml`).
@@ -70,7 +78,7 @@ Verified in `test/memory_check.py`: zero lost writes under 8 concurrent threads 
 
 ## Storage
 
-SQLite at `cfg["memory"]["db_path"]` (default `./memory_store/memory.db`, gitignored — regenerable local data). Four tables: `sessions` (per-session/user bookkeeping and counters), `messages` (the transcript, paired into turns via a `turn_number` column — not list-index arithmetic, which is what made `old/create_chatbot.py`'s `previous_messages[i+1]` unsafe), `facts` (`user_id`-scoped, idempotent upsert), and `message_embeddings` (one row per completed turn, brute-force cosine-matched for cross-session recall).
+SQLite at `cfg["memory"]["db_path"]` (default `./memory_store/memory.db`, gitignored — regenerable local data). Four tables: `sessions` (per-session/user bookkeeping, extraction counters, and a `rolling_summary` column a future agent's own compression pass can read/write via `get_rolling_summary`/`set_rolling_summary`), `messages` (the transcript, paired into turns via a `turn_number` column — not list-index arithmetic, which is what made `old/create_chatbot.py`'s `previous_messages[i+1]` unsafe), `facts` (`user_id`-scoped, idempotent upsert), and `message_embeddings` (one row per completed turn, brute-force cosine-matched for cross-session recall).
 
 ## Configuration
 
@@ -97,6 +105,8 @@ python -m memory_engine show SESSION_ID [--turns N]
 python -m memory_engine facts SESSION_ID
 python -m memory_engine needs-extraction SESSION_ID
 python -m memory_engine upsert-fact SESSION_ID KEY VALUE [--confidence F] [--turns-covered N]
+python -m memory_engine summary SESSION_ID
+python -m memory_engine set-summary SESSION_ID TEXT
 python -m memory_engine clear SESSION_ID
 ```
 

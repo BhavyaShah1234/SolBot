@@ -4,6 +4,8 @@
     python -m memory_engine facts SESSION_ID
     python -m memory_engine needs-extraction SESSION_ID
     python -m memory_engine upsert-fact SESSION_ID KEY VALUE [--confidence F] [--turns-covered N]
+    python -m memory_engine summary SESSION_ID
+    python -m memory_engine set-summary SESSION_ID TEXT
     python -m memory_engine clear SESSION_ID
 
 Manual inspection/testing tool, mirroring ``db_engine/__main__.py``'s shape.
@@ -16,7 +18,9 @@ from memory_engine import (
     clear_session,
     get_profile_facts,
     get_recent_context,
+    get_rolling_summary,
     needs_extraction,
+    set_rolling_summary,
     upsert_facts,
 )
 
@@ -42,6 +46,13 @@ def main() -> None:
     upsert_parser.add_argument("--confidence", type=float, default=1.0)
     upsert_parser.add_argument("--turns-covered", type=int, default=0)
 
+    summary_parser = subparsers.add_parser("summary", help="Print a session's rolling summary")
+    summary_parser.add_argument("session_id")
+
+    set_summary_parser = subparsers.add_parser("set-summary", help="Manually set a session's rolling summary")
+    set_summary_parser.add_argument("session_id")
+    set_summary_parser.add_argument("text")
+
     clear_parser = subparsers.add_parser("clear", help="Clear a session's messages (keeps facts)")
     clear_parser.add_argument("session_id")
 
@@ -57,6 +68,11 @@ def main() -> None:
         fact = {"key": args.key, "value": args.value, "confidence": args.confidence}
         result = upsert_facts(args.session_id, [fact], args.turns_covered)
         print(json.dumps(result, indent=2))
+    elif args.command == "summary":
+        print(get_rolling_summary(args.session_id))
+    elif args.command == "set-summary":
+        set_rolling_summary(args.session_id, args.text)
+        print(f"set rolling summary for session {args.session_id}")
     elif args.command == "clear":
         clear_session(args.session_id)
         print(f"cleared session {args.session_id}")

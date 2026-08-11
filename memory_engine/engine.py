@@ -205,6 +205,35 @@ class MemoryEngine:
             self._run_write_transaction(_write)
         checkpoint(get_connection(self._cfg))
 
+    def get_rolling_summary(self, session_id: str) -> Optional[str]:
+        """Returns this session's rolling summary, or None if unset or the session doesn't exist.
+
+        Read-only, no lock -- same pattern as ``get_profile_facts``.
+        """
+        conn = get_connection(self._cfg)
+        row = conn.execute("SELECT rolling_summary FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        return row[0] if row else None
+
+    def set_rolling_summary(self, session_id: str, summary: str) -> None:
+        """Atomically overwrites this session's rolling summary.
+
+        Intended for a future agent's own compression pass (e.g. folding
+        older turns into a running summary once a session gets long) --
+        this method only stores whatever text it's given; it never
+        generates or compresses anything itself, same boundary as the
+        rest of this package. Creates the session row if it doesn't exist
+        yet.
+        """
+
+        def _write(conn: sqlite3.Connection):
+            ensure_session(conn, session_id, self._cfg)
+            conn.execute(
+                "UPDATE sessions SET rolling_summary = ? WHERE session_id = ?", (summary, session_id)
+            )
+
+        with session_lock(session_id):
+            self._run_write_transaction(_write)
+
     def _maybe_embed_turn(self, session_id: str, turn_number: int) -> None:
         """Best-effort: embeds a just-completed turn and stores it for recall.
 

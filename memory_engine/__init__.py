@@ -26,6 +26,8 @@ __all__ = [
     "recall_related",
     "needs_extraction",
     "upsert_facts",
+    "get_rolling_summary",
+    "set_rolling_summary",
     "clear_session",
     "read_config",
     "MemoryEngine",
@@ -131,6 +133,21 @@ def upsert_facts(
         ``{"upserted": int}``.
     """
     return get_engine(cfg).upsert_facts(session_id, facts, turns_covered)
+
+
+def get_rolling_summary(session_id: str, cfg: Optional[dict] = None) -> Optional[str]:
+    """Returns this session's rolling summary, or None if unset or the session doesn't exist."""
+    return get_engine(cfg).get_rolling_summary(session_id)
+
+
+def set_rolling_summary(session_id: str, summary: str, cfg: Optional[dict] = None) -> None:
+    """Atomically overwrites this session's rolling summary.
+
+    Intended for a future agent's own compression pass over older turns.
+    This package only stores the given text -- it never generates or
+    compresses anything itself.
+    """
+    get_engine(cfg).set_rolling_summary(session_id, summary)
 
 
 def clear_session(session_id: str, cfg: Optional[dict] = None) -> None:
