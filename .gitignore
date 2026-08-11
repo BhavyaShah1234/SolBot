@@ -1,3 +1,9 @@
+# SolBot: local vector database + freshness manifest + lock file (regenerable build artifacts)
+/asu_rc/
+
+# SolBot: local conversation/memory store (regenerable, and contains real conversation content)
+/memory_store/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -187,6 +193,9 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file. However, if you prefer,
 #  you could uncomment the following to ignore the entire vscode folder
 .vscode/
+
+# Claude Code local session state (settings, worktree checkouts, scheduled-task locks)
+.claude/
 
 # Ruff stuff:
 .ruff_cache/

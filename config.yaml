@@ -1,0 +1,97 @@
+confluence:
+  url: "https://asurc.atlassian.net/wiki"
+  space: "RC"
+  page_fetch_page_size: 100
+
+chunking:
+  chunk_size: 1000
+  chunk_overlap: 200
+
+embedding:
+  model: "qwen3-embedding:4b"
+  base_url: "http://192.168.0.32:11434"
+
+vector_store:
+  db_directory: "./asu_rc"
+  collection_name: "ASU-Research-Computing"
+  distance_metric: "cosine"
+  manifest_path: "./asu_rc/manifest.json"
+  lock_path: "./asu_rc/.db_engine.lock"
+
+logging:
+  log_file: "db_engine.log"
+
+retrieval:
+  top_k: 5
+  score_threshold: 0.5
+  dense_k: 12
+  sparse_k: 12
+  rrf_k_constant: 60
+  bm25_k1: 1.5
+  bm25_b: 0.75
+  use_mmr: true
+  mmr_lambda: 0.6
+  final_k: 5
+  min_evidence_score: 0.55
+  min_evidence_count: 2
+
+generation:
+  model: "qwen3:4b"
+  base_url: "http://192.168.0.32:11434"
+  temperature: 0.1
+  json_temperature: 0.0
+  num_ctx: 8192
+  request_timeout_seconds: 180
+
+insight:
+  evidence_distill_enabled: true
+  evidence_distill_max_facts: 6
+  compression_target_words: 120
+
+planner:
+  max_nodes: 6
+  max_depth: 4
+  decomposition_threshold_words: 8
+  allow_replanning: true
+  max_replans: 1
+
+worker:
+  max_react_steps: 4
+  answer_max_words: 180
+  max_parallel_nodes: 3
+  escalate_to_web_below_confidence: 0.55
+
+verification:
+  min_overall_confidence: 0.45
+  escalation_message: "I don't have enough grounded information to answer that confidently."
+  escalation_contact: "the ASU Research Computing team"
+
+app:
+  timezone: "America/Phoenix"
+  log_file: "agents.log"
+  log_level: "INFO"
+
+memory:
+  db_path: "./memory_store/memory.db"
+  default_session_id: "default"
+  default_user_id: "default"
+  default_context_window_turns: 6
+  extraction_interval_turns: 8
+  busy_timeout_ms: 5000
+  write_retry_attempts: 3
+  recall_top_k: 5
+  recall_score_threshold: 0.55
+  log_file: "memory_engine.log"
+
+web:
+  enabled: true
+  search_provider: ddgs
+  extraction_backend: trafilatura
+  max_results: 5
+  search_timeout_seconds: 10
+  fetch_timeout_seconds: 15
+  max_fetch_chars: 12000
+  min_extracted_chars: 200
+  blocked_domains:
+    - pinterest.com
+    - quora.com

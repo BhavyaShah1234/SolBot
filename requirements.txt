@@ -1,0 +1,13 @@
+atlassian-python-api>=4.0
+markdownify>=1.2
+langchain-core>=1.2
+langchain-text-splitters>=1.0
+langchain-chroma>=1.1
+langchain-ollama>=1.0
+python-dotenv>=1.2
+PyYAML>=6.0
+filelock>=3.19
+ddgs>=9.14
+trafilatura>=1.12
+requests>=2.31
+numpy>=1.26

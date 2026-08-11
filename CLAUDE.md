@@ -4,99 +4,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-SolBot is a RAG-based CLI chatbot for ASU Research Computing. It answers questions about ASU supercomputers (Sol, Agave), HPC clusters, and RC administrative policies by retrieving relevant documentation chunks from a local Chroma vector store.
+SolBot is a RAG-based CLI chatbot for ASU Research Computing. It answers questions about ASU supercomputers (Sol, Agave), HPC clusters, and RC administrative policies by retrieving relevant documentation chunks from a local Chroma vector store, decomposing compound questions into sub-tasks, and synthesizing a grounded, cited reply — with a fallback to open-web search when RC's own documentation doesn't cover something.
 
-**The project is currently mid-revamp.** See "Revamp plan" below for the authoritative, in-progress design — it supersedes the architecture described later in this file wherever the two disagree. Read the revamp plan first before making changes.
+The revamp described below (Phases 1-2) is **complete and in active use**. Phase 3 (systematic adversarial testing) and Phase 4 (web deployment) are not started.
 
 ## Repository layout
 
-- `old/create_vector_db.py`, `old/create_chatbot.py` — the original, working v1 implementation. Kept as a reference for what to fix, not as code to build on. See "Known issues in v1" below.
-- `new/` — an AI-generated (Claude web), unreviewed rewrite attempt (`config.py`, `dag.py`, `ingest.py`, `orchestrator.py`, `planner.py`, `worker.py`, etc.). It is **non-functional** — `main.py` and `test_solbot.py` import `from solbot import ...` but no `solbot` package exists anywhere on disk, and `new/__init__.py` itself has a broken self-referential import. Left untouched on disk for now (not deleted, not archived) but **not being built on** — none of its code is to be reused or imported. Its module boundaries (config/store/retrieval/memory/llm/tools/orchestrator/worker) and a few specific mechanisms (manifest-diffed incremental sync, query-rewriting for memory, RRF+MMR retrieval fusion, evidence-sufficiency gating for web search) are useful *design reference* for Phase 2 of the revamp plan below.
-- Root level — where the revamp's Phase 1 files live once written (`config.py`, `ingest.py`, `retrieval_check.py`, `.env.example`, `requirements.txt`).
+- **`db_engine/`** — owns the Chroma vector store: builds it from Confluence, keeps it in sync via a manifest-diffed incremental sync (add/update/delete by page, idempotent re-runs), and serves `fetch()`/`get_all_chunks()`. Never generates text. See `db_engine/README.md` for the full API, CLI, and concurrency model.
+- **`memory_engine/`** — SQLite-backed conversation memory: message history, per-turn recall via embedding similarity across a user's sessions, and long-term user facts (name, timezone, preferences). Never calls an LLM to reason, only to embed. See `memory_engine/README.md`.
+- **`web_search/`** — standalone, read-only open-web search + page-content extraction (`search()` via `ddgs`, `fetch_page()` via `requests` + `trafilatura`). Zero dependency on any other package here. See `web_search/README.md`.
+- **`agents/`** — the orchestrator/worker chatbot itself: `python -m agents` for the interactive CLI. Wires everything above together as a plain bounded loop (`contextualize -> route -> plan -> execute -> verify -> replan? -> synthesize`), not a graph library — see `agents/orchestrator.py`'s module docstring. Decomposes compound queries into a DAG of sub-questions (`agents/dag.py`, `agents/planner.py`), answers each via a bounded ReAct loop over tools (`agents/worker.py`, `agents/tools.py`: `vector_search`, `web_search`, `fetch_url`, `current_time`), fuses dense+BM25 retrieval with MMR reranking (`agents/fusion.py`), and audits findings for groundedness before writing a final reply (`agents/synthesis.py`). `\debug` (route/plan/verification trace) and `\thinking` (raw model reasoning) are togglable at the CLI prompt.
+- **`old/`** — the original, hand-written v1 (`create_vector_db.py`, `create_chatbot.py`). Kept as historical reference for the specific bugs that motivated this rewrite — see "Known issues in v1" below, which cites exact line numbers here. Not built on, not run.
+- **`test/`** — manual, human-read validation harnesses (`retrieval_check.py`, `generation_check.py`, `chat_check.py`) predating any real pytest suite. Not automated regression tests yet (that's Phase 3).
+- **`config.yaml`** — single source of truth for all packages' tunables (Confluence, chunking, embedding/generation model + `base_url`, retrieval fusion weights, planner/worker/verification thresholds, memory, web search). `.env` (gitignored) holds `CONFLUENCE_USERNAME`/`CONFLUENCE_API_TOKEN` only.
+- **Gitignored, regenerable local data** (not committed): `asu_rc/` (the Chroma vector store + sync manifest), `memory_store/` (the SQLite conversation DB), `*.log` (per-package log files).
 
-## Running the project (current v1, in `old/`)
+## Running the project
 
-**Prerequisites:** Ollama must be running locally. `old/` uses `nomic-embed-text` (embeddings) and `gemma3` (chat) — **note:** the revamp instead standardizes on `qwen3-embedding:latest` (embeddings) and `qwen3:latest` (chat), the models actually pulled locally; `old/`'s model names are being phased out, not the target going forward.
+**Prerequisites:** Ollama reachable (locally or via `config.yaml`'s `base_url` overrides) with the configured chat and embedding models pulled.
 
-**Step 1 — Build the vector database** (run once, or to refresh docs):
 ```bash
-python old/create_vector_db.py
-```
-Scrapes all pages from the `RC` Confluence space at `asurc.atlassian.net`, converts HTML to Markdown, splits by headers then by character, embeds, and persists to `./asu_rc` (Chroma).
+pip install -r requirements.txt
+cp .env.example .env        # fill in CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN
 
-**Step 2 — Run the chatbot:**
-```bash
-python old/create_chatbot.py
-```
-Interactive CLI loop. Type `\quit` to exit, `\clear` to reset conversation history. Logs written to `rough.log`.
-
-### Known issues in v1 (driving the revamp)
-
-1. **Semantic averaging** — embedding a compound query (e.g. "Which cluster has A100 GPUs and how do I request one for 4 hours?") produces one centroid vector between two unrelated topic regions, so top-k similarity search returns mediocre chunks from neither.
-2. **Taxonomy is not a plan** — `classify_query` (`old/create_chatbot.py:24-40`) forces every query into exactly one of 6 mutually exclusive labels; real queries are multi-intent.
-3. **Frozen knowledge** — `create_vector_db.py` does a one-shot `Chroma.from_documents` rebuild (`old/create_vector_db.py:40`) with no incremental sync or freshness signal. Also: hard `limit=500` with no pagination loop (`old/create_vector_db.py:20`), and a metadata bug where `'id': page['title']` uses the page title instead of the actual Confluence page id (`old/create_vector_db.py:28`).
-4. **Closed world** — no access to anything outside the RC Confluence space (live cluster status, upstream Slurm/NVIDIA docs, web).
-5. **Cost bug + latent bugs in memory** — `filter_messages_based_on_similarity` (`old/create_chatbot.py:59-66`) issues one LLM call per historical message per turn, and indexes `previous_messages[i + 1]` with no bounds check (IndexError risk). `get_previous_messages` (`old/create_chatbot.py:42-46`) has an always-true guard condition (dead code): `max_previous_turns = -2 * turns` is always negative, so `len(...) >= max_previous_turns` is always true. `SCORE_THRESHOLD = 0.7` (`old/create_chatbot.py:16`) is declared and never applied. Confluence `USERNAME`/`API_KEY` are hardcoded placeholders in the script (`old/create_vector_db.py:12-13`) rather than env vars. Also: inconsistent dict keys returned across the six `answer_*` handlers (`previous_message_referred` vs `previous_messages_referred`), `int(classify_query(...))` with no try/except (crashes on non-numeric LLM output), log filename `rough.log` is a leftover debug name.
-
----
-
-## Revamp plan
-
-### Context
-
-A prior rewrite attempt (`new/`) produced an ambitious orchestrator/worker/DAG architecture but the code is broken and unreviewed (see "Repository layout" above). The plan is to rewrite from scratch, in phases, so every file is understood and owned by the author — the way `old/` was — while fixing the five known issues above.
-
-**Scope clarification (important, narrower than "vector DB then chatbot" might suggest):** Phase 1 is vector-database-only — creation plus manual, trigger-based freshness updates. It explicitly does **not** include LLM generation or a working chat loop. Phase 1's "testing" means validating retrieval/augmentation quality with simple canned queries (simulating what a future worker agent would be handed), with no generation involved. The chatbot itself — decomposition, generation, memory, multi-intent handling — is Phase 2, built as an **orchestrator + worker agents** architecture (the orchestrator decomposes a compound query into sub-tasks; each worker researches its assigned sub-task against the vector store; results are synthesized into one reply). This is deliberately similar in shape to what `new/`'s `dag.py`/`orchestrator.py`/`planner.py`/`worker.py` were reaching for — useful as design reference, though none of that code is being reused. Web search (fixing "closed world") is explicitly deferred to the **end of Phase 2**, after the orchestrator/worker RAG-only pipeline is tested end-to-end; in Phase 2 it's triggered by worker agents when their assigned research turns up thin evidence, and that same evidence gap is what will (eventually) trigger vector-DB updates automatically — in Phase 1, the update trigger is manual only.
-
-Models: `qwen3:latest` for generation (Phase 2 onward), `qwen3-embedding:latest` for embeddings (Phase 1 onward) — both confirmed as the models actually pulled in the local Ollama install, replacing `old/`'s `gemma3`/`nomic-embed-text`.
-
-### Phase 1 — Vector Database: Creation, Freshness, Retrieval Validation
-
-Scope: build and maintain the Chroma knowledge base, and prove retrieval quality on its own. No LLM chat loop, no generation.
-
-**Target files** (root of repo, small and few by design — mirrors `old/`'s one-file-per-concern simplicity, scoped to ingestion only):
-```
-config.py            # small constants module + .env loader (no config.yaml yet — only add if constants sprawl)
-ingest.py             # build/sync the vector DB (replaces old/create_vector_db.py)
-retrieval_check.py    # manual validation harness: canned queries -> retrieved chunks + scores, no LLM call
-.env.example          # CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN
-requirements.txt
+python -m db_engine          # build/sync the vector store (first run: full build; reruns: near-instant diff-sync)
+python -m agents              # interactive chatbot: \quit, \clear, \debug, \thinking
 ```
 
-**Step 1 — `ingest.py`: correct the ingestion pipeline, one-shot build.** Carry over `old/create_vector_db.py`'s working parts (Confluence → markdownify → `MarkdownHeaderTextSplitter` → `RecursiveCharacterTextSplitter` → `OllamaEmbeddings(qwen3-embedding:latest)` → Chroma), fixing: paginated `get_all_pages_from_space` (loop on `start` instead of a single `limit=500` call), correct `'id': page['id']` metadata (not title), credentials from `.env` via `config.py`, a sensible log filename. Verify: run `python ingest.py`, confirm page/chunk counts logged, collection exists at `./asu_rc`.
+Each package's own README (`db_engine/README.md`, `memory_engine/README.md`, `web_search/README.md`) has its full public API, CLI, and config reference — not duplicated here.
 
-**Step 2 — `ingest.py`: manifest-diffed incremental sync (manual trigger).** JSON manifest (e.g. `./asu_rc/manifest.json`) mapping `page_id -> {version, hash}`. Each run: skip pages whose version+hash match the manifest; for new/changed pages, re-chunk with deterministic chunk ids (`f"{page_id}::{chunk_index}"`) and `upsert` into Chroma (idempotent); for pages removed upstream, delete their chunk ids and drop from the manifest. Needs direct `chromadb` collection access for id-based upsert/delete (`langchain_chroma.Chroma.from_documents` doesn't expose this cleanly — check whether `Chroma._collection` is sufficient or drop to the raw `chromadb` client). Trigger is manual: `python ingest.py` always does a full diff-sync (empty manifest = first full build, same code path). Verify: run twice back-to-back with no upstream changes — second run reports 0 changed/added/deleted, no embedding calls issued. Then hand-edit the manifest to simulate a changed page and confirm the diff picks it up.
+### Known issues in v1 (`old/`) — what this rewrite fixed
 
-**Step 3 — `retrieval_check.py`: retrieval/augmentation validation harness.** Standalone script, **no LLM generation call**: a handful of canned test queries standing in for what a future worker agent would be handed as an already-decomposed sub-task (e.g. "What GPUs does the Sol cluster have?", "How do I request a GPU allocation on Sol?", "What is ASU RC's appointment scheduling policy?"); run similarity search with `TOP_K` and (finally, actually) `SCORE_THRESHOLD` applied to filter weak matches; print/log each query's retrieved chunks with scores and source metadata for manual review. This is the practical proof that per-sub-question retrieval (the atomic case decomposition will produce in Phase 2) returns good chunks — the fix for issue #1 (semantic averaging), without yet needing an orchestrator to do the decomposing. Verify: run `python retrieval_check.py`, manually confirm each canned query's top chunks are topically correct.
+1. **Semantic averaging** — embedding a compound query produced one centroid vector between unrelated topic regions, so top-k similarity returned mediocre chunks from neither. Fixed by `agents/planner.py` decomposing compound queries into a DAG of atomic sub-questions, each retrieved independently.
+2. **Taxonomy is not a plan** — `classify_query` (`old/create_chatbot.py:24-40`) forced every query into one of 6 exclusive labels. Fixed by the same DAG decomposition: intent is per-sub-task, not a single label for the whole message.
+3. **Frozen knowledge** — `create_vector_db.py` did a one-shot rebuild with no incremental sync (`old/create_vector_db.py:40`), a hard `limit=500` with no pagination (`old/create_vector_db.py:20`), and a metadata bug using the page title as its id (`old/create_vector_db.py:28`). Fixed by `db_engine`'s manifest-diffed sync with proper pagination and real Confluence page ids.
+4. **Closed world** — no access outside the RC Confluence space. Fixed by `agents/tools.py`'s `web_search`/`fetch_url` tools, escalated when vector-search evidence is thin (`agents/fusion.py`'s sufficiency check, `agents/worker.py`'s confidence-based escalation).
+5. **Memory cost bug + latent bugs** — `filter_messages_based_on_similarity` (`old/create_chatbot.py:59-66`) issued one LLM call per historical message per turn, with an unguarded `previous_messages[i+1]` IndexError risk; `get_previous_messages` (`old/create_chatbot.py:42-46`) had a dead/always-true guard; `SCORE_THRESHOLD` was declared but never applied; Confluence credentials were hardcoded (`old/create_vector_db.py:12-13`). Fixed by `agents/contextualize.py` (one rewrite call per turn, not per message), `memory_engine`'s `turn_number`-based pairing (no list-index arithmetic), `db_engine`/`agents` actually applying `score_threshold`, and `.env`-sourced credentials throughout.
 
-**Open item:** check `langchain_chroma.Chroma`'s upsert/delete-by-id support against the installed version early in Step 2; drop to the raw `chromadb` client for the storage layer if it's too restrictive (keep `langchain_text_splitters` for chunking either way).
+### Models
 
-### Phase 2 — Orchestrator + Worker Agents (Generation, decomposition, memory)
+`qwen3:4b` for generation, `qwen3-embedding:4b` for embeddings, both reachable via `config.yaml`'s `base_url` (may point at a networked Ollama instance rather than localhost — check current `config.yaml` for where). Chosen after real-hardware benchmarking showed structured-reasoning calls (contextualize/route/plan/verify/synthesize, not bare completions) cost ~35-50s each regardless of local vs. remote on CPU-bound inference — smaller models were the effective lever, not network placement.
 
-Direction-level (to be re-planned in detail once Phase 1 is reviewed):
+## What's left
 
-- **Orchestrator**: decomposes a compound query into sub-tasks (fixes #1 semantic averaging and #2 taxonomy-is-not-a-plan — intent becomes a per-sub-task tag, not one exclusive label for the whole message), dispatches to worker(s), synthesizes their findings into one reply.
-- **Worker agent(s)**: each takes one sub-task, retrieves from the vector store (reusing/formalizing Phase 1's retrieval logic), and — RAG-only at first — produces a finding using `qwen3`. Web search is explicitly *not* in the first pass.
-- **Memory**: single contextualization call per turn (rewrite query using recent history) replacing the O(turns) `filter_messages_based_on_similarity` cost bug; fix the dead-condition bug in `get_previous_messages` outright.
-- **End-of-Phase-2 steps** (only after the orchestrator/worker RAG pipeline is tested end-to-end): add a `web_search` tool workers can call when their research turns up thin evidence (fixes #4 closed world); wire that same "thin evidence" signal to trigger `ingest.py`'s sync programmatically, closing the freshness loop (upgrading Phase 1's manual-only trigger).
-- **Structure**: build this properly separated from the start (config, store, retrieval, memory, llm client, orchestrator, worker, tools, cli) rather than monolith-then-refactor — `new/`'s module boundaries are a reasonable reference for *what* to separate, though its DAG/LangGraph machinery and code are not reused. Apply DRY/SOLID/KISS as this is built.
-- Also fix while rebuilding the chat side: inconsistent handler dict keys, unguarded `int(classify_query(...))` parsing, `rough.log` filename (see "Known issues in v1" above).
-
-### Phase 3 — Adversarial testing (direction only)
-
-Once Phase 2's modules exist to test in isolation: malformed/non-JSON LLM output on every structured call site; Ollama unreachable/timeout; Confluence API errors/rate limits/pagination edge cases; empty retrieval results; empty/short conversation history (regression test for the exact `previous_messages[i+1]` IndexError shape); concurrent ingest runs; web search timeouts/failures; prompt injection via retrieved or fetched content; unicode/markdown edge cases from `markdownify`; worker-failure and partial-synthesis cases specific to the orchestrator/worker design.
-
-### Phase 4 — Web deployment (direction only)
-
-Thin API layer over the orchestrator (one `/chat` endpoint + health check); session/history storage decision for multi-worker deployment (in-memory won't survive restarts — needs Redis/SQLite/etc., deferred); containerization (Ollama likely stays a separate service); scheduled ingest sync (cron/systemd timer/APScheduler, deferred); auth/rate-limiting once public-facing.
-
-### Verification approach across Phase 1
-
-- `python ingest.py` run twice consecutively → second run reports zero changes, zero embedding calls.
-- Manual manifest edit (simulate a Confluence page change) → next run correctly re-embeds only that page.
-- `python retrieval_check.py` → manually confirm each canned query's top-`TOP_K` chunks (post `SCORE_THRESHOLD` filter) are topically on-target.
-- No LLM generation is exercised in Phase 1 by design — nothing to verify there yet.
-
-### Credentials
-
-Confluence username + API token must be moved to environment variables (`.env`, gitignored) before any ingestion runs — never hardcoded, unlike `old/create_vector_db.py`'s placeholders.
+- **Phase 3 — adversarial testing** (not started): malformed/non-JSON LLM output at every structured call site beyond what's already guarded, Ollama/network unreachable mid-session (currently uncaught — crashes the CLI, see `agents/__main__.py`), Confluence API errors/rate limits, empty retrieval results, concurrent ingest runs, web search timeouts, prompt injection via retrieved/fetched content, worker-failure and partial-synthesis edge cases. `test/*.py`'s manual harnesses are the starting point, not a substitute for this.
+- **Phase 4 — web deployment** (not started): thin API layer over `agents.Session`, session/history storage decision for multi-worker deployment, containerization, scheduled ingest sync, auth/rate-limiting.
+- **Known open issue**: retrieval sometimes ranks a narrower page (e.g. a specific accelerator type) above a more complete hardware-overview page for broad "what hardware does X have" questions, and synthesis can overstate a negative claim not fully supported by the top-ranked chunk alone. Partially mitigated (user-provided URLs are now fetched directly and treated as authoritative ground truth — see `agents/orchestrator.py`'s `_fetch_user_urls`), but the underlying ranking behavior itself hasn't been changed.
