@@ -23,6 +23,7 @@ package.
 
 import json
 import logging
+import os
 import random
 import sqlite3
 import threading
@@ -42,11 +43,34 @@ _VALID_ROLES = ("system", "user", "assistant")
 _NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 
+def _configure_logging(cfg: dict) -> None:
+    """Attaches a file handler to the ``memory_engine`` logger hierarchy, once.
+
+    Every submodule logs via ``logging.getLogger(__name__)`` (e.g.
+    ``memory_engine.facts``), which propagates up to the ``memory_engine``
+    logger by default -- so attaching one handler here at
+    ``cfg["memory"]["log_file"]`` is enough to persist warnings from
+    anywhere in the package (invalid fact_key rejections, failed
+    embedding calls, etc.), instead of them only reaching Python's default
+    stderr handler-of-last-resort and never being written anywhere.
+    """
+    root = logging.getLogger("memory_engine")
+    if root.handlers:
+        return
+    log_path = cfg["memory"]["log_file"]
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.WARNING)
+
+
 class MemoryEngine:
     """Owns a config and dispatches to the storage/recall/facts modules under lock."""
 
     def __init__(self, cfg: dict) -> None:
         self._cfg = cfg
+        _configure_logging(cfg)
 
     def append_message(
         self, session_id: str, role: str, content: str, metadata: Optional[dict] = None
