@@ -13,6 +13,7 @@ SolBot is a RAG-based CLI chatbot for ASU Research Computing. It answers questio
 - `old/create_vector_db.py`, `old/create_chatbot.py` — the original, working v1 implementation. Kept as a reference for what to fix, not as code to build on. See "Known issues in v1" below.
 - `new/` — an AI-generated (Claude web), unreviewed rewrite attempt (`config.py`, `dag.py`, `ingest.py`, `orchestrator.py`, `planner.py`, `worker.py`, etc.). It is **non-functional** — `main.py` and `test_solbot.py` import `from solbot import ...` but no `solbot` package exists anywhere on disk, and `new/__init__.py` itself has a broken self-referential import. Left untouched on disk for now (not deleted, not archived) but **not being built on** — none of its code is to be reused or imported. Its module boundaries (config/store/retrieval/memory/llm/tools/orchestrator/worker) and a few specific mechanisms (manifest-diffed incremental sync, query-rewriting for memory, RRF+MMR retrieval fusion, evidence-sufficiency gating for web search) are useful *design reference* for Phase 2 of the revamp plan below.
 - Root level — where the revamp's Phase 1 files live once written (`config.py`, `ingest.py`, `retrieval_check.py`, `.env.example`, `requirements.txt`).
+- `web_search/` — a standalone, read-only tool package for open-web search and page-content extraction. Built ahead of the revamp plan's stated sequencing (the plan below scopes web search to *end of Phase 2*) at explicit user request, as a self-contained module with no dependency on `db_engine` or any orchestrator/worker. See "Web search tool" under the revamp plan below for full design, config, and usage.
 
 ## Running the project (current v1, in `old/`)
 
@@ -70,6 +71,81 @@ requirements.txt
 **Step 3 — `retrieval_check.py`: retrieval/augmentation validation harness.** Standalone script, **no LLM generation call**: a handful of canned test queries standing in for what a future worker agent would be handed as an already-decomposed sub-task (e.g. "What GPUs does the Sol cluster have?", "How do I request a GPU allocation on Sol?", "What is ASU RC's appointment scheduling policy?"); run similarity search with `TOP_K` and (finally, actually) `SCORE_THRESHOLD` applied to filter weak matches; print/log each query's retrieved chunks with scores and source metadata for manual review. This is the practical proof that per-sub-question retrieval (the atomic case decomposition will produce in Phase 2) returns good chunks — the fix for issue #1 (semantic averaging), without yet needing an orchestrator to do the decomposing. Verify: run `python retrieval_check.py`, manually confirm each canned query's top chunks are topically correct.
 
 **Open item:** check `langchain_chroma.Chroma`'s upsert/delete-by-id support against the installed version early in Step 2; drop to the raw `chromadb` client for the storage layer if it's too restrictive (keep `langchain_text_splitters` for chunking either way).
+
+### Web search tool (`web_search/`) — built standalone, ahead of Phase 2
+
+The plan above scopes web search to *end of Phase 2*, triggered by worker agents when RAG evidence is thin. That trigger doesn't exist yet — no orchestrator/worker code exists anywhere in the authoritative tree. This package was built now anyway, at explicit user request, as a **standalone tool module with zero dependency on `db_engine` or any orchestrator** — something a future Phase 2 worker will call, not something that calls into Phase 2 machinery itself.
+
+**Key design difference from `db_engine`:** this tool is pure read-only — nothing it does ever mutates shared state. `db_engine` needs two-layer locking (in-process `Lock` + cross-process `FileLock`) because it serializes writes to the vector store; `web_search` has no writes to serialize, so it has **no locking, no singleton, no shared mutable state at all**. Every call is independent — verified safe under concurrent threads *and* concurrent separate OS processes (see "Verified" below), which is the realistic shape of "multiple worker agents calling this at once."
+
+**Where the actual difficulty is:** raw fetched HTML is full of navigation, ads, cookie banners, related-article rails, and footers. The disowned `new/tools.py`'s `fetch_url` (design reference only, not reused) ran `markdownify` over the *entire* raw HTML — it kept everything, cleaned nothing. Getting real grounding material out of a fetched page means actually stripping that boilerplate down to the substantive content, which is the problem this package's `extract.py` solves.
+
+**Module map:**
+
+| File | Responsibility |
+|---|---|
+| `__init__.py` | Public API surface: re-exports `search`, `fetch_page`, `SearchResult`, `ExtractedPage`, `ExtractionFailed`, `read_config` |
+| `config.py` | Standalone YAML config loader — reads `config.yaml`'s `web:` section only, merged over built-in defaults. Deliberately duplicates a few lines rather than importing `db_engine.config.read_config`, so this package has no import-time dependency on `db_engine` at all |
+| `search.py` | Cheap capability: `search(query)` — queries `ddgs` (DuckDuckGo Search, no API key, no formal quota), filters `blocked_domains`, returns `SearchResult(title, url, snippet)` — snippets only, no page fetch |
+| `extract.py` | Expensive capability, and the core of this package: `fetch_page(url)` — fetches raw HTML via `requests`, then runs it through `trafilatura` (DOM-heuristic content extraction) to strip nav/ads/boilerplate down to the actual article/doc text, returning `ExtractedPage(title, url, text, truncated)` |
+| `__main__.py` | `python -m web_search search "query"` / `fetch "url"` — manual CLI harness, no LLM call, same spirit as Phase 1's (not-yet-built) `retrieval_check.py`: human eyeballs the output for quality |
+
+**Why `search()` and `fetch_page()` are kept separate** (not one auto-fetching call): a calling agent controls when it pays the cost of a full page fetch — cheap snippet search first, then selectively fetch+clean only the promising URLs. Same shape as `new/tools.py`'s split between its `web_search` and `fetch_url` tools, though no code from there is reused.
+
+**Provider choices, and why:**
+- **`ddgs`** for search — free, open-source, no API key, no formal quota (the practical caveat: DuckDuckGo's unofficial backend can soft-rate-limit under heavy scraping volume — there's no contractual cap, but it's not bulletproof either). A self-hosted SearXNG instance was considered as a fully self-owned alternative and rejected for now — disproportionate infra (Docker, engine config) for a single tool module at this stage.
+- **`trafilatura`** for content extraction — Apache-2.0, actively maintained, purpose-built for locating a page's main-content region and discarding the rest. Preferred over `readability-lxml` (older heuristics, less actively maintained) and over blanket HTML-to-markdown conversion (keeps everything, the exact gap this package closes).
+
+Both are config-gated behind a `provider`-style key (`web.search_provider`, `web.extraction_backend`) that only accepts one value today and raises `NotImplementedError` on anything else — the key exists so a second provider is a config change later, not a rewrite, without building unused abstraction now.
+
+**Config — `config.yaml`'s `web:` section:**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | If `false`, `search()` raises `RuntimeError` rather than returning `[]` — an empty list must always mean "no hits," never "misconfigured" |
+| `search_provider` | `ddgs` | Only `"ddgs"` supported; anything else raises `NotImplementedError` |
+| `extraction_backend` | `trafilatura` | Only `"trafilatura"` supported; anything else raises `NotImplementedError` |
+| `max_results` | `5` | Default cap on `search()` hits, overridable per call |
+| `search_timeout_seconds` | `10` | `ddgs` query timeout |
+| `fetch_timeout_seconds` | `15` | `requests.get` timeout in `fetch_page()` |
+| `max_fetch_chars` | `12000` | Extracted text is truncated here; `ExtractedPage.truncated` is set to `True` if cut |
+| `min_extracted_chars` | `200` | Below this, extraction is treated as failed (`ExtractionFailed`), not returned as thin content |
+| `blocked_domains` | `[]` | Checked against every `search()` hit's URL *and* every `fetch_page()` URL (defense in depth — a blocked domain can't be fetched directly even if it wasn't reached through `search()`) |
+
+**Usage:**
+
+```python
+from web_search import search, fetch_page, ExtractionFailed
+
+hits = search("What GPUs does the Sol cluster have?")
+for hit in hits:
+    print(hit.title, hit.url, hit.snippet)
+
+try:
+    page = fetch_page(hits[0].url)
+    print(page.title, len(page.text), page.truncated)
+except ExtractionFailed:
+    ...  # this URL didn't pan out — try the next hit instead
+```
+
+```bash
+python -m web_search search "What GPUs does the Sol cluster have?"
+python -m web_search fetch "https://cores.research.asu.edu/research-computing/capabilities"
+```
+
+**Exception contract** (deliberately no try/except around the network call itself — `requests.RequestException` on network failure propagates as-is; a future Phase 2 worker's tool-calling wrapper is the right layer to catch-and-degrade a failed tool call, not this module):
+
+| Exception | Raised when |
+|---|---|
+| `RuntimeError` | `web.enabled` is `False` |
+| `NotImplementedError` | `web.search_provider` or `web.extraction_backend` is set to an unsupported value |
+| `ValueError` | `fetch_page()` called on a URL matching `blocked_domains` |
+| `ExtractionFailed` (subclass of `RuntimeError`) | Page fetched successfully but `trafilatura` found no usable main content, or the result is shorter than `min_extracted_chars` — a JS-only shell page is the typical cause |
+| `requests.RequestException` (and subclasses) | Network failure, timeout, or non-2xx response in `fetch_page()` — left to propagate uncaught |
+
+**Verified:** standalone sequential calls (`search`, `fetch_page`, all exception paths above); concurrent calls from multiple threads in one process (`search` alone, then mixed `search`/`fetch_page`); concurrent calls from four separate OS processes simultaneously (the realistic shape of independent worker agents) — all completed correctly with no shared-state issues, confirming the no-locking design holds under real concurrency, not just threads.
+
+**Not yet wired into anything:** no Phase 2 worker exists to call this yet. When one does, it's expected to call `search()` first, then selectively `fetch_page()` on promising results, catching `ExtractionFailed` to move on to the next candidate — the same pattern `new/worker.py`'s (unreused) confidence-gated escalation loop follows.
 
 ### Phase 2 — Orchestrator + Worker Agents (Generation, decomposition, memory)
 
