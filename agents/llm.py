@@ -12,7 +12,7 @@ import json
 import logging
 import math
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
@@ -20,6 +20,19 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 logger = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+
+
+class LLMUnavailableError(RuntimeError):
+    """Raised when the underlying Ollama call itself fails (network/connection/timeout).
+
+    Distinct from a parse failure (which ``LLM.json()`` already tolerates
+    via its ``default`` fallback) -- this means the model couldn't be
+    reached at all. ``LLM.json()`` catches this internally and falls
+    through to ``default`` (retrying a dead server wouldn't help);
+    ``LLM.text()`` lets it propagate, since freeform final-answer text has
+    no sensible stand-in value -- ``Session.ask()`` is the layer that
+    catches it and degrades to a canned message.
+    """
 
 
 class LLM:
@@ -60,8 +73,27 @@ class LLM:
         self.show_thinking = False
         self.thinking_log: list[tuple[str, str]] = []
 
+    def _invoke(self, llm: ChatOllama, messages: list):
+        """Calls ``llm.invoke()``, re-raising any failure as :class:`LLMUnavailableError`.
+
+        Centralizes the one place that talks to Ollama for both
+        :meth:`text` and :meth:`json`, so a connection error/timeout/
+        Ollama-down condition is always surfaced the same way regardless
+        of caller.
+        """
+        try:
+            return llm.invoke(messages, reasoning=True) if self.show_thinking else llm.invoke(messages)
+        except Exception as exc:  # noqa: BLE001 - any invoke failure is treated as "LLM unreachable"
+            raise LLMUnavailableError(f"Ollama call failed: {exc}") from exc
+
     def text(
-        self, role: str, system: str, user: str, temperature: Optional[float] = None
+        self,
+        role: str,
+        system: str,
+        user: str,
+        temperature: Optional[float] = None,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_thinking_chunk: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Makes one freeform chat completion call.
 
@@ -73,25 +105,81 @@ class LLM:
             user: The user-turn content.
             temperature: Overrides ``cfg["generation"]["temperature"]`` for
                 this call only.
+            on_chunk: If given, streams the call via ``ChatOllama.stream()``
+                instead of ``invoke()``, calling ``on_chunk(piece)`` for
+                each incremental answer-text piece as it arrives. Still
+                returns the full accumulated string at the end, identical
+                return contract to the non-streaming path.
+            on_thinking_chunk: If given (independently of ``on_chunk``),
+                also streams and calls ``on_thinking_chunk(piece)`` for
+                each incremental reasoning piece. Only ever fires when
+                ``show_thinking`` is ``True`` (that's what makes Ollama
+                return ``reasoning_content`` at all) — passing this with
+                ``show_thinking`` off is harmless, it just never fires.
+                Reasoning content is never part of the return value,
+                streamed or not, matching ``thinking_log``'s existing
+                side-channel design.
 
         Returns:
             The model's response text.
+
+        Raises:
+            LLMUnavailableError: If the underlying Ollama call fails
+                (network/connection/timeout, including partway through a
+                stream). Freeform text has no sensible stand-in value to
+                degrade to, so this propagates — ``Session.ask()`` is the
+                layer that catches it. Any chunks already delivered via
+                ``on_chunk``/``on_thinking_chunk`` before the failure stay
+                on screen; streaming trades "nothing shown until an error
+                is ruled out" for "instant feedback," and a failure mid-
+                stream is a rare, acceptable rough edge of that tradeoff.
         """
         llm = self._with_temperature(temperature)
         messages = [SystemMessage(system), HumanMessage(user)]
         logger.debug("llm.text role=%s chars=%d", role, len(user))
-        response = llm.invoke(messages, reasoning=True) if self.show_thinking else llm.invoke(messages)
-        self._record_thinking(role, response)
-        return response.content
+
+        if on_chunk is None and on_thinking_chunk is None:
+            response = self._invoke(llm, messages)
+            self._record_thinking(role, response)
+            return response.content
+
+        return self._stream(role, llm, messages, on_chunk, on_thinking_chunk)
+
+    def _stream(
+        self,
+        role: str,
+        llm: ChatOllama,
+        messages: list,
+        on_chunk: Optional[Callable[[str], None]],
+        on_thinking_chunk: Optional[Callable[[str], None]],
+    ) -> str:
+        """Streams one call, dispatching answer/reasoning pieces to their callbacks as they arrive."""
+        pieces: list[str] = []
+        try:
+            stream = llm.stream(messages, reasoning=True) if self.show_thinking else llm.stream(messages)
+            for chunk in stream:
+                reasoning_piece = chunk.additional_kwargs.get("reasoning_content")
+                if reasoning_piece and on_thinking_chunk:
+                    on_thinking_chunk(reasoning_piece)
+                if chunk.content:
+                    pieces.append(chunk.content)
+                    if on_chunk:
+                        on_chunk(chunk.content)
+        except Exception as exc:  # noqa: BLE001 - a mid-stream failure is still "LLM unreachable"
+            raise LLMUnavailableError(f"Ollama stream failed: {exc}") from exc
+        # Streamed reasoning was already shown live via on_thinking_chunk -- do NOT
+        # also append it to thinking_log, or \debug's post-hoc drain would show it twice.
+        return "".join(pieces)
 
     def json(self, role: str, system: str, user: str, default: Any = None) -> Any:
         """Makes one chat completion call and parses the response as JSON.
 
         Retries once with a stricter follow-up instruction if the first
-        response doesn't parse. Never raises on malformed output — callers
-        in this package are built around graceful degradation (e.g.
-        ``planner.plan()`` falling back to a single-node plan), so a
-        parse failure here returns ``default`` rather than propagating.
+        response doesn't parse. Never raises — callers in this package are
+        built around graceful degradation (e.g. ``planner.plan()`` falling
+        back to a single-node plan), so both a parse failure and an
+        underlying Ollama-unavailable condition return ``default`` rather
+        than propagating (no point retrying a dead server).
 
         Args:
             role: A short label for what's calling this — logged only.
@@ -99,7 +187,8 @@ class LLM:
                 to respond with JSON only.
             user: The user-turn content.
             default: Returned if both the initial call and the repair
-                retry fail to produce parseable JSON.
+                retry fail to produce parseable JSON, or if Ollama can't
+                be reached at all.
 
         Returns:
             The parsed JSON value, or ``default`` on failure.
@@ -107,7 +196,11 @@ class LLM:
         llm = self._with_temperature(self._json_temperature)
         messages = [SystemMessage(system), HumanMessage(user)]
         logger.debug("llm.json role=%s chars=%d", role, len(user))
-        response = llm.invoke(messages, reasoning=True) if self.show_thinking else llm.invoke(messages)
+        try:
+            response = self._invoke(llm, messages)
+        except LLMUnavailableError:
+            logger.warning("llm.json role=%s LLM unavailable, using default", role)
+            return default
         self._record_thinking(role, response)
         raw = response.content
         try:
@@ -121,7 +214,11 @@ class LLM:
                 "value — no prose, no markdown fences, no explanation."
             )
         ]
-        raw_retry = llm.invoke(repair_messages).content
+        try:
+            raw_retry = self._invoke(llm, repair_messages).content
+        except LLMUnavailableError:
+            logger.warning("llm.json role=%s LLM unavailable during repair retry, using default", role)
+            return default
         try:
             return extract_json(raw_retry)
         except ValueError:
@@ -234,3 +331,17 @@ def cosine(a: list[float], b: list[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    """Coerces an LLM-supplied JSON field to a float, tolerating garbage.
+
+    A weak/confused model (or adversarial retrieved content trying to
+    manipulate a structured field) can emit a non-numeric ``confidence``
+    value; every call site that pulls a float out of parsed LLM JSON
+    should use this instead of a bare ``float(...)`` cast.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default

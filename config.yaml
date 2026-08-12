@@ -70,6 +70,7 @@ app:
   timezone: "America/Phoenix"
   log_file: "agents.log"
   log_level: "INFO"
+  max_query_chars: 4000
 
 memory:
   db_path: "./memory_store/memory.db"

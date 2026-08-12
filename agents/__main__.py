@@ -3,30 +3,38 @@
 Usage:
     python -m agents
 
-Type a question and press enter. ``\\quit`` exits, ``\\clear`` resets this
-session's conversation history (personalization facts persist -- see
-``memory_engine.clear_session``). ``\\debug`` toggles a per-turn trace
-(route decision, plan DAG, per-node confidence/tools used, verification
-outcome -- the same fields ``Session.ask()`` already returns, see
-``test/chat_check.py``'s ``_print_trace`` for the design this mirrors).
-``\\thinking`` toggles showing the model's raw reasoning trace for every
-LLM call made during a turn (requests Ollama's separated reasoning mode --
-see ``agents/llm.py``'s ``show_thinking`` -- which costs extra generated
-tokens/latency while on, hence off by default). Both toggle independently
-and can be flipped mid-session. On a real terminal, debug lines print in
-cyan and thinking lines in dim magenta, distinct from the plain-text
-answer -- colors are skipped automatically when stdout isn't a tty (e.g.
-piped/redirected output). Logs to ``cfg["app"]["log_file"]``
+Type a question and press enter. The final answer streams in live,
+token-by-token, as it's generated -- a real turn costs ~35-90s, and
+without streaming the terminal would sit blank the whole time.
+``\\quit`` exits, ``\\clear`` resets this session's conversation history
+(personalization facts persist -- see ``memory_engine.clear_session``).
+``\\debug`` toggles a per-turn trace (route decision, plan DAG, per-node
+confidence/tools used, verification outcome -- the same fields
+``Session.ask()`` already returns, see ``test/chat_check.py``'s
+``_print_trace`` for the design this mirrors), printed after the answer
+finishes streaming. ``\\thinking`` toggles showing the model's raw
+reasoning trace live too (requests Ollama's separated reasoning mode --
+see ``agents/llm.py``'s ``show_thinking``/``LLM.text()``'s
+``on_thinking_chunk`` -- which costs extra generated tokens/latency while
+on, hence off by default); reasoning streams first, then the answer, the
+order a reasoning model actually emits tokens in. Both toggles operate
+independently and can be flipped mid-session. On a real terminal, debug
+lines print in cyan and thinking lines in dim magenta, distinct from the
+plain-text answer -- colors are skipped automatically when stdout isn't a
+tty (e.g. piped/redirected output). Logs to ``cfg["app"]["log_file"]``
 (default ``agents.log``), tagged per-turn/per-node -- see
 ``agents/logging_setup.py``.
 """
 
+import logging
 import sys
 import uuid
 
 from agents.config import read_config
 from agents.logging_setup import configure_logging
 from agents.orchestrator import Session
+
+logger = logging.getLogger(__name__)
 
 _RESET = "\033[0m"
 _DEBUG_COLOR = "\033[36m"  # cyan -- structured trace info
@@ -82,6 +90,26 @@ def _print_debug_trace(result: dict) -> None:
         )
 
 
+def _stream_answer(piece: str) -> None:
+    """Prints one incremental piece of the final answer as it's generated.
+
+    Passed as ``Session.ask()``'s ``on_chunk`` callback -- without this,
+    the CLI blocks silently for the whole ~35-90s a real turn costs before
+    anything appears on screen at all.
+    """
+    print(piece, end="", flush=True)
+
+
+def _stream_thinking(piece: str) -> None:
+    """Prints one incremental piece of the model's live reasoning trace.
+
+    Passed as ``Session.ask()``'s ``on_thinking_chunk`` callback, only
+    when ``\\thinking`` mode is on. Reasoning streams before the answer,
+    the order a reasoning model actually emits tokens in.
+    """
+    print(_colorize(piece, _THINKING_COLOR), end="", flush=True)
+
+
 def _print_thinking_log(llm) -> None:
     """Prints and clears any reasoning traces captured during the last turn, for ``\\thinking`` mode.
 
@@ -133,12 +161,25 @@ def main() -> None:
             print(f"(thinking trace {state})")
             continue
 
-        result = session.ask(query)
+        try:
+            result = session.ask(
+                query,
+                on_chunk=_stream_answer,
+                on_thinking_chunk=_stream_thinking if session.llm.show_thinking else None,
+            )
+        except Exception:
+            logger.exception("main: session=%s query=%r raised", session.session_id, query)
+            print()
+            print("Sorry, something went wrong answering that. Please try again.")
+            continue
+        print()  # newline after the streamed answer (and any streamed thinking) completes
         if session.llm.show_thinking:
+            # Only the *non*-streamed internal calls (contextualize/route/plan/verify) land
+            # here -- the final answer's own reasoning already streamed live above via
+            # on_thinking_chunk, and agents.llm.LLM never double-records it into thinking_log.
             _print_thinking_log(session.llm)
         if debug_mode:
             _print_debug_trace(result)
-        print(result["answer"])
 
 
 if __name__ == "__main__":
