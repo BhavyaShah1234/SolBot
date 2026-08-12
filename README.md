@@ -2,7 +2,7 @@
 
 A RAG-based CLI chatbot for **ASU Research Computing** (RC). SolBot answers questions about ASU's supercomputers (Sol, Agave), HPC clusters, Slurm usage, storage, and RC administrative policies by retrieving relevant documentation chunks from a local vector store built from RC's Confluence space — decomposing compound questions into sub-tasks, researching each one (falling back to the open web when RC's own docs don't cover something), auditing its own findings for groundedness, and streaming a cited, grounded reply live to the terminal.
 
-The current implementation is a full rewrite of an earlier, simpler version (`old/`) — see [Project history](#project-history) below for what changed and why.
+The current implementation is a full rewrite of an earlier, simpler version — see [Project history](#project-history) below for what changed and why.
 
 ## Features
 
@@ -53,7 +53,7 @@ Four independent packages, each with a single clear responsibility, wired togeth
 | [`web_search/`](web_search/README.md) | Standalone, read-only open-web search + page-content extraction. Zero dependency on any other package here. |
 | `agents/` | The chatbot itself — wires everything above together as a plain bounded loop (`contextualize → route → plan → execute → verify → replan? → synthesize`), not a graph library. `python -m agents` is the interactive entry point. |
 
-Each package's own README has its full public API, CLI, and config reference. `CLAUDE.md` has the complete architectural rationale and history for anyone working on the code itself.
+Each package's own README has its full public API, CLI, and config reference.
 
 ## Getting started
 
@@ -106,7 +106,6 @@ db_engine/       Chroma vector store, Confluence sync
 memory_engine/   conversation history, facts, cross-session recall
 web_search/      open-web search + page extraction
 test/            manual validation harnesses + an adversarial fuzz-input suite
-old/             the original v1 implementation, kept as historical reference
 config.yaml      all tunables
 .env             Confluence credentials (gitignored, not committed)
 ```
@@ -134,7 +133,7 @@ Regenerable local data (gitignored, not committed): `asu_rc/` (the vector store)
 
 ## Project history
 
-SolBot began as a single-pass v1 (`old/create_vector_db.py`, `old/create_chatbot.py`) with a 6-way intent classifier and one-shot vector store build. Five concrete problems drove the rewrite into what exists today:
+SolBot began as a single-pass v1 with a 6-way intent classifier and one-shot vector store build. Five concrete problems drove the rewrite into what exists today:
 
 1. **Semantic averaging** — embedding a compound query produced one centroid vector between unrelated topic regions, returning mediocre results for both. Fixed by decomposing into a DAG of atomic sub-questions, each retrieved independently.
 2. **Taxonomy is not a plan** — a single exclusive intent label can't represent a compound, multi-part question. Fixed by the same decomposition: intent is per-sub-task now.
@@ -142,4 +141,3 @@ SolBot began as a single-pass v1 (`old/create_vector_db.py`, `old/create_chatbot
 4. **Closed world** — no access to anything outside RC's own Confluence space. Fixed by the web-search/fetch-url escalation path.
 5. **A memory cost bug and several latent bugs** — the original history-filtering logic issued one LLM call *per historical message per turn*, had an always-true dead-code guard, an unguarded index risk, a declared-but-unused score threshold, and hardcoded credentials. Fixed by a single per-turn contextualization call, `memory_engine`'s `turn_number`-based pairing, an actually-applied score threshold, and `.env`-sourced credentials throughout.
 
-`CLAUDE.md` has the full technical detail and exact line references for all of the above, for anyone digging into the history.

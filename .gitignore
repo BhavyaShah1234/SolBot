@@ -214,3 +214,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Claude Code local guidance file -- not committed, README.md is the shared/public docs
+CLAUDE.md
