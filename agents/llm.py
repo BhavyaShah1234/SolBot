@@ -20,6 +20,71 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 logger = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+_LEAKED_THINK_RE = re.compile(r"^.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+_THINK_CLOSE = "</think>"
+# Generous headroom for a leaked reasoning block before giving up on ever seeing
+# a closing tag and flushing what's buffered as ordinary content -- observed
+# directly against a live qwen3 deployment: a leaked block ran ~1300 chars for
+# a one-line greeting alone, so this stays well above that rather than cutting
+# a real (if verbose) block off mid-buffer and leaking half of it.
+_MAX_THINK_BUFFER = 6000
+
+
+def _strip_leaked_think(text: str) -> str:
+    """Strips a leaked reasoning block some Ollama setups still emit inline in
+    ``content`` even when reasoning mode was explicitly requested off.
+
+    Observed directly against a live qwen3 deployment: passing ``"think": false``
+    straight to Ollama's ``/api/chat`` (bypassing this wrapper entirely) still
+    returned a full chain-of-thought block in ``content``, not routed through
+    ``reasoning_content`` as documented -- and the chat template pre-fills the
+    ``<think>`` opening tag itself, so the leaked text never contains a literal
+    opening tag, only the trailing ``</think>``. Reasoning belongs in
+    ``reasoning_content``, never in the user-facing answer, so stripping
+    everything up to and including the first ``</think>`` is safe to apply
+    unconditionally -- a legitimate answer has no reason to contain that string.
+    """
+    return _LEAKED_THINK_RE.sub("", text, count=1) if _THINK_CLOSE in text.lower() else text
+
+
+class _ThinkStreamFilter:
+    """Buffers streamed output until a leaked reasoning block (see
+    ``_strip_leaked_think``) is fully seen and can be dropped, or until it's
+    clear none is coming.
+    """
+
+    def __init__(self):
+        self._buf = ""
+        self._resolved = False
+
+    def feed(self, text: str) -> str:
+        if self._resolved:
+            return text
+        self._buf += text
+        if _THINK_CLOSE in self._buf.lower():
+            self._resolved = True
+            return _strip_leaked_think(self._buf)
+        if len(self._buf) >= _MAX_THINK_BUFFER:
+            self._resolved = True
+            return self._buf
+        return ""  # still buffering -- no closing tag seen yet
+
+    def flush(self) -> str:
+        """Releases whatever's still buffered once the stream has ended.
+
+        Reached whenever the whole answer came in under ``_MAX_THINK_BUFFER``
+        and never contained a leaked block at all (the ordinary case for a
+        short answer) -- without this, ``feed()`` alone would hold those
+        bytes forever and the caller would see an empty answer. A no-op if
+        ``feed()`` already resolved during the loop (a leaked block *was*
+        found and already stripped-and-returned there) -- otherwise this
+        would re-emit the raw, unstripped buffer a second time on top of
+        that already-correct output.
+        """
+        if self._resolved:
+            return ""
+        self._resolved = True
+        return self._buf
 
 
 class LLMUnavailableError(RuntimeError):
@@ -82,7 +147,7 @@ class LLM:
         of caller.
         """
         try:
-            return llm.invoke(messages, reasoning=True) if self.show_thinking else llm.invoke(messages)
+            return llm.invoke(messages, reasoning=self.show_thinking)
         except Exception as exc:  # noqa: BLE001 - any invoke failure is treated as "LLM unreachable"
             raise LLMUnavailableError(f"Ollama call failed: {exc}") from exc
 
@@ -141,7 +206,7 @@ class LLM:
         if on_chunk is None and on_thinking_chunk is None:
             response = self._invoke(llm, messages)
             self._record_thinking(role, response)
-            return response.content
+            return _strip_leaked_think(response.content)
 
         return self._stream(role, llm, messages, on_chunk, on_thinking_chunk)
 
@@ -153,18 +218,37 @@ class LLM:
         on_chunk: Optional[Callable[[str], None]],
         on_thinking_chunk: Optional[Callable[[str], None]],
     ) -> str:
-        """Streams one call, dispatching answer/reasoning pieces to their callbacks as they arrive."""
+        """Streams one call, dispatching answer/reasoning pieces to their callbacks as they arrive.
+
+        A leaked leading ``<think>...</think>`` block (see ``_strip_leaked_think``)
+        is buffered and dropped rather than streamed -- ``_ThinkStreamFilter`` holds
+        back output only while it's still ambiguous whether one is opening. That
+        filter only runs when ``show_thinking`` is off: when it's on, ``reasoning=True``
+        already gets ``content`` cleanly separated from ``reasoning_content`` (verified
+        directly against this deployment), so content chunks stream through immediately
+        with no buffering delay -- running the filter there too would only hold back a
+        clean answer waiting for a closing tag that, by construction, will never come.
+        """
         pieces: list[str] = []
+        think_filter = None if self.show_thinking else _ThinkStreamFilter()
         try:
-            stream = llm.stream(messages, reasoning=True) if self.show_thinking else llm.stream(messages)
+            stream = llm.stream(messages, reasoning=self.show_thinking)
             for chunk in stream:
                 reasoning_piece = chunk.additional_kwargs.get("reasoning_content")
                 if reasoning_piece and on_thinking_chunk:
                     on_thinking_chunk(reasoning_piece)
                 if chunk.content:
-                    pieces.append(chunk.content)
+                    piece = think_filter.feed(chunk.content) if think_filter else chunk.content
+                    if piece:
+                        pieces.append(piece)
+                        if on_chunk:
+                            on_chunk(piece)
+            if think_filter:
+                leftover = think_filter.flush()
+                if leftover:
+                    pieces.append(leftover)
                     if on_chunk:
-                        on_chunk(chunk.content)
+                        on_chunk(leftover)
         except Exception as exc:  # noqa: BLE001 - a mid-stream failure is still "LLM unreachable"
             raise LLMUnavailableError(f"Ollama stream failed: {exc}") from exc
         # Streamed reasoning was already shown live via on_thinking_chunk -- do NOT
@@ -202,7 +286,7 @@ class LLM:
             logger.warning("llm.json role=%s LLM unavailable, using default", role)
             return default
         self._record_thinking(role, response)
-        raw = response.content
+        raw = _strip_leaked_think(response.content)
         try:
             return extract_json(raw)
         except ValueError:
@@ -215,7 +299,7 @@ class LLM:
             )
         ]
         try:
-            raw_retry = self._invoke(llm, repair_messages).content
+            raw_retry = _strip_leaked_think(self._invoke(llm, repair_messages).content)
         except LLMUnavailableError:
             logger.warning("llm.json role=%s LLM unavailable during repair retry, using default", role)
             return default

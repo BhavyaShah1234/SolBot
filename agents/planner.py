@@ -1,7 +1,7 @@
 """Query routing and decomposition for the orchestrator.
 
 Three functions, cheap-to-expensive: :func:`route` picks a coarse path
-(often for free, no LLM call), :func:`plan` decomposes a research query
+with one classification call, :func:`plan` decomposes a research query
 into a DAG, :func:`replan` patches a plan that turned out to have gaps.
 Every failure mode degrades gracefully to something that still answers
 the user rather than raising — mirrors ``new/planner.py``'s design
@@ -11,16 +11,11 @@ query, or a structurally invalid graph all fall back to
 """
 
 import logging
-import re
 
 from agents.dag import Plan, PlanError, PlanNode, plan_from_dict, single_node_plan, validate_plan
 from agents.llm import LLM
 
 logger = logging.getLogger(__name__)
-
-_GREETING_RE = re.compile(
-    r"^(hi|hello|hey|thanks|thank you|ok|okay|cool|great|bye|goodbye|yo|sup)[\s!.,]*$", re.IGNORECASE
-)
 
 # Domain-grounding, prepended to prompts observed to be at risk of entity
 # confusion on a small model: "Sol" and "Agave" are ASU Research Computing's
@@ -66,10 +61,7 @@ Do not repeat existing node ids. New node ids must be new. Stay within the ASU R
 
 
 def route(llm: LLM, cfg: dict, query: str) -> str:
-    """Classifies a query into ``"chat"``, ``"clarify"``, or ``"research"``.
-
-    Short-circuits to ``"chat"`` for obvious greetings/thanks without an
-    LLM call at all; otherwise makes one classification call.
+    """Classifies a query into ``"chat"``, ``"clarify"``, or ``"research"`` via one LLM call.
 
     Args:
         llm: The shared LLM client.
@@ -83,11 +75,6 @@ def route(llm: LLM, cfg: dict, query: str) -> str:
         default (worst case: an unnecessary research pass, not a dropped
         question).
     """
-    stripped = query.strip()
-    if len(stripped.split()) <= 4 and _GREETING_RE.match(stripped):
-        logger.info("route: short-circuited to chat (greeting pattern), query=%r", query)
-        return "chat"
-
     result = llm.json("route", _ROUTE_SYSTEM, query, default={"route": "research"})
     route_value = result.get("route", "research") if isinstance(result, dict) else "research"
     if route_value not in ("chat", "clarify", "research"):

@@ -2,11 +2,16 @@
 
 Wraps ``atlassian.Confluence`` to fetch pages from the RC space, either all
 at once (for a full sync) or one at a time by id (for a targeted update).
-Deliberately avoids ``Confluence.get_all_pages_from_space()``: its own
-built-in pagination loop stops after exactly one page whenever the space is
-larger than one page-size (its terminator condition, ``len(results) <=
-limit``, is true on the very first full batch). ``get_all_pages_from_space_raw``
-is called directly instead, with the pagination loop driven here.
+Uses the Cloud v2 API (``api_version=2``) rather than the library's default
+legacy v1-compatible client: Confluence Cloud has retired the v1 ``content``
+REST endpoints that the legacy client's ``get_all_pages_from_space``/
+``get_all_pages_from_space_raw`` were built on (confirmed directly against a
+live instance -- the legacy client's calls silently returned 0 results,
+having received the site's HTML shell back instead of JSON). The v2 list
+endpoint (``get_pages``) also can't return rendered ``view``-format bodies
+itself (``body-format`` there is restricted to storage/atlas_doc_format/
+markdown) the way the old one-shot bulk fetch could, so a full sync here is
+a list-then-fetch-each-page's-view-body two-step instead of one bulk call.
 """
 
 from atlassian import Confluence
@@ -15,28 +20,32 @@ from db_engine.config import require_confluence_credentials
 
 
 def _client(cfg: dict) -> Confluence:
-    """Builds an authenticated Confluence client from config and environment.
+    """Builds an authenticated Confluence Cloud v2 client from config and environment.
 
     Args:
         cfg: The loaded configuration dict; only ``cfg["confluence"]["url"]``
             is used here.
 
     Returns:
-        An authenticated ``atlassian.Confluence`` client.
+        An authenticated ``atlassian.Confluence`` client backed by the
+        Cloud v2 API (``api_version=2`` -- see module docstring for why).
 
     Raises:
         RuntimeError: If Confluence credentials are missing from the
             environment (propagated from ``require_confluence_credentials``).
     """
     username, api_token = require_confluence_credentials()
-    return Confluence(url=cfg["confluence"]["url"], username=username, password=api_token, cloud=True)
+    return Confluence(
+        url=cfg["confluence"]["url"], username=username, password=api_token, cloud=True, api_version=2
+    )
 
 
 def fetch_all_pages(cfg: dict) -> list[dict]:
     """Fetches every current page in the configured Confluence space.
 
-    Drives its own ``start``/``limit`` pagination loop rather than relying
-    on the client library's built-in one (see module docstring for why).
+    Lists every current page id in the space (cheap, no bodies), then fetches
+    each one's rendered body individually -- see module docstring for why a
+    single bulk call can't do both on the v2 API.
 
     Args:
         cfg: The loaded configuration dict; reads ``cfg["confluence"]``.
@@ -51,23 +60,20 @@ def fetch_all_pages(cfg: dict) -> list[dict]:
     """
     client = _client(cfg)
     conf = cfg["confluence"]
-    pages: list[dict] = []
-    start, limit = 0, conf["page_fetch_page_size"]
-    while True:
-        response = client.get_all_pages_from_space_raw(
-            space=conf["space"],
-            start=start,
-            limit=limit,
-            expand="body.view,version",
-            status="current",
-            content_type="page",
-        )
-        batch = response.get("results", [])
-        pages.extend(batch)
-        if len(batch) < limit:
-            break
-        start += limit
-    return [_to_page_dict(p, conf["url"]) for p in pages]
+    space = client.get_space_by_key(conf["space"])
+    # body_format is passed explicitly (rather than left at get_pages()'s own
+    # default) because that default requests "body-format=none", which the
+    # live API rejects outright (400: "none" isn't a valid
+    # PrimaryBodyRepresentation) -- confirmed directly against this Confluence
+    # Cloud instance. The listing's own body isn't used below (each page's
+    # rendered view body is fetched individually instead), so the format
+    # chosen here doesn't matter beyond being one the API will accept.
+    listing = client.get_pages(
+        space_id=space["id"], status="current", body_format="storage", limit=conf["page_fetch_page_size"]
+    )
+    return [
+        _to_page_dict(client.get_page_by_id(page["id"], body_format="view"), conf["url"]) for page in listing
+    ]
 
 
 def fetch_page(page_id: str, cfg: dict) -> dict:
@@ -87,7 +93,7 @@ def fetch_page(page_id: str, cfg: dict) -> dict:
     """
     client = _client(cfg)
     conf = cfg["confluence"]
-    page = client.get_page_by_id(page_id, expand="body.view,version")
+    page = client.get_page_by_id(page_id, body_format="view")
     return _to_page_dict(page, conf["url"])
 
 
