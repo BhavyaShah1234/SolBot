@@ -55,7 +55,6 @@ _DEFAULTS = {
     },
     "worker": {
         "max_react_steps": 4,
-        "answer_max_words": 180,
         "max_parallel_nodes": 3,
         "escalate_to_web_below_confidence": 0.55,
     },

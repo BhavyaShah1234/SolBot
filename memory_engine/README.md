@@ -85,7 +85,6 @@ SQLite at `cfg["memory"]["db_path"]` (default `./memory_store/memory.db`, gitign
 ```yaml
 memory:
   db_path: "./memory_store/memory.db"
-  default_session_id: "default"
   default_user_id: "default"
   default_context_window_turns: 6
   extraction_interval_turns: 8

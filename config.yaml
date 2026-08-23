@@ -31,12 +31,24 @@ retrieval:
   bm25_b: 0.75
   use_mmr: true
   mmr_lambda: 0.6
-  final_k: 5
+  # 12, not 5: measured directly against the live store for "What GPUs does the
+  # Sol cluster have?" -- the "Sol Hardware - How to Request" page (the one
+  # actually listing Sol's A100/A30 nodes) does not enter the evidence set at
+  # all until final_k reaches ~11-12, so the model never saw it and answered
+  # from the narrower "Gaudi Accelerators" page alone. Widening the candidate
+  # pool (dense_k/sparse_k up to 40) and indexing page titles into BM25 were
+  # both tried first and neither surfaced it -- the underlying cause is that
+  # the page's content is a large markdown table, which embeds poorly, so
+  # raising final_k is the only lever that works without re-chunking at ingest.
+  # Costs more evidence per node (slower distillation); the "never assert
+  # absence" rules in worker.py/synthesis.py are the safety net for the cases
+  # this still misses.
+  final_k: 12
   min_evidence_score: 0.55
   min_evidence_count: 2
 
 generation:
-  model: "qwen3:4b"
+  model: "qwen3:8b"
   base_url: "http://192.168.0.32:11434"
   temperature: 0.1
   json_temperature: 0.0
@@ -45,7 +57,14 @@ generation:
 
 insight:
   evidence_distill_enabled: true
-  evidence_distill_max_facts: 6
+  # 20, not 6: distillation was reframed from "extract only what's relevant"
+  # (a filter) to "restate everything on-topic in full sentences" (a
+  # reformatter) -- see _DISTILL_SYSTEM in agents/insight.py. A cap of 6 fought
+  # that directly: a hardware-inventory question can legitimately yield a dozen
+  # distinct items, and truncating them is what made SolBot conclude the
+  # dropped ones did not exist. This is a safety valve against a runaway
+  # response, not a target length.
+  evidence_distill_max_facts: 20
   compression_target_words: 120
 
 planner:
@@ -57,7 +76,6 @@ planner:
 
 worker:
   max_react_steps: 4
-  answer_max_words: 180
   max_parallel_nodes: 3
   escalate_to_web_below_confidence: 0.55
 
@@ -74,7 +92,6 @@ app:
 
 memory:
   db_path: "./memory_store/memory.db"
-  default_session_id: "default"
   default_user_id: "default"
   default_context_window_turns: 6
   extraction_interval_turns: 8
